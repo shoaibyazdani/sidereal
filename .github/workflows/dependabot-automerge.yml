@@ -23,7 +23,7 @@ jobs:
       !github.event.pull_request.draft
     runs-on: ubuntu-latest
     outputs:
-      update-type: ${{ steps.metadata.outputs.update-type }}
+      eligible: ${{ steps.policy.outputs.eligible }}
     steps:
       # Never check out or execute PR code in this privileged workflow.
       - name: Read verified Dependabot metadata
@@ -32,12 +32,19 @@ jobs:
         with:
           github-token: ${{ github.token }}
 
+      - name: Require every dependency to be a patch or minor update
+        id: policy
+        env:
+          DEPENDENCIES: ${{ steps.metadata.outputs.updated-dependencies-json }}
+        run: |
+          eligible=$(jq -r 'length > 0 and all(.[];
+            .updateType == "version-update:semver-patch" or
+            .updateType == "version-update:semver-minor")' <<< "$DEPENDENCIES")
+          echo "eligible=$eligible" >> "$GITHUB_OUTPUT"
+
   enqueue:
     needs: metadata
-    # For grouped PRs, update-type is the highest semver change in the group.
-    if: >-
-      needs.metadata.outputs.update-type == 'version-update:semver-patch' ||
-      needs.metadata.outputs.update-type == 'version-update:semver-minor'
+    if: needs.metadata.outputs.eligible == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Create repository-scoped App token

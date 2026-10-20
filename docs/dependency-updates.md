@@ -3,7 +3,7 @@
 Dependabot proposes dependency updates using `.github/dependabot.yml`.
 The `Dependabot auto-merge` workflow requests automatic merging for verified
 patch and minor updates targeting `main`. A grouped update qualifies only when
-its highest semver change is patch or minor. Major updates and updates without
+every dependency has a patch or minor update type. Major updates and updates without
 recognized semver metadata need a maintainer to review and enqueue them.
 Nix input revisions may fall into this manual category.
 
