@@ -25,8 +25,10 @@ of commits, issues, and chat.
 1. Under the `sidereal-io` organization's **Settings → Developer settings →
    GitHub Apps**, create an App for dependency merging. Disable webhooks;
    the workflow starts the App's work.
-2. Grant repository permissions **Contents: Read and write** and **Pull requests:
-   Read and write**. GitHub supplies read access to metadata automatically.
+2. Grant repository permissions **Contents: Read and write**, **Pull requests:
+   Read and write**, and **Workflows: Read and write**. The Workflows permission
+   allows GitHub Actions dependency updates to be merged. GitHub supplies read
+   access to metadata automatically.
    No organization permissions or ruleset bypass permissions are needed.
 3. Install the App on **only `sidereal-io/sidereal`**.
 4. Copy its Client ID into the repository's Actions variable

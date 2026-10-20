@@ -55,6 +55,7 @@ jobs:
           private-key: ${{ secrets.DEPENDABOT_MERGE_APP_PRIVATE_KEY }}
           permission-contents: write
           permission-pull-requests: write
+          permission-workflows: write
 
       - name: Request merge through the queue
         env:
