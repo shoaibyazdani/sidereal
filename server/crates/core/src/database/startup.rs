@@ -7,7 +7,7 @@ use sqlx::{
     Connection, Executor, PgConnection, PgPool, Row,
 };
 use std::{
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tokio::{sync::Semaphore, time::timeout};
@@ -23,31 +23,95 @@ const LOCK: &str = "SELECT pg_advisory_lock(1397310533, 1)";
 const UNLOCK: &str = "SELECT pg_advisory_unlock(1397310533, 1)";
 const READY_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cause {
+    Database(DatabaseError),
+    Timeout,
+}
+
+impl std::fmt::Display for Cause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout => f.write_str("timed out"),
+            Self::Database(error) => f.write_str(error.label()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Probe {
+    Ready,
+    NotReady(Cause),
+    Busy,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Change {
+    Ready,
+    NotReady(Cause),
+}
+
+impl std::fmt::Display for Change {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ready => f.write_str("readiness: ready"),
+            Self::NotReady(cause) => write!(f, "readiness: not ready ({cause})"),
+        }
+    }
+}
+
+pub struct ProbeResult {
+    pub outcome: Probe,
+    pub change: Option<Change>,
+    ready: bool,
+}
+
+impl ProbeResult {
+    /// Includes the cached answer when another probe is already active.
+    pub fn is_ready(&self) -> bool {
+        self.ready
+    }
+}
+
 #[derive(Clone)]
 pub struct Database {
     operational: PgPool,
     readiness: PgPool,
     permit: Arc<Semaphore>,
+    last: Arc<Mutex<Option<Cause>>>,
 }
 
 impl Database {
     pub async fn ready(&self) -> bool {
+        self.probe().await.is_ready()
+    }
+
+    pub async fn probe(&self) -> ProbeResult {
         let Ok(_permit) = self.permit.try_acquire() else {
-            return false;
+            return ProbeResult {
+                outcome: Probe::Busy,
+                change: None,
+                ready: self.last.lock().unwrap().is_none(),
+            };
         };
+        let mut acquired = false;
         let result = timeout(READY_TIMEOUT, async {
             let conn = self
                 .readiness
                 .acquire()
                 .await
                 .map_err(DatabaseError::from)?;
+            acquired = true;
             // Detach immediately: cancellation always closes the socket instead of
             // returning a connection with outstanding work to the readiness pool.
             let mut conn = conn.detach();
             let result = async {
                 conn.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
                     .await?;
-                conn.execute("SET LOCAL statement_timeout = '2000ms'")
+                // The outer deadline owns cancellation and closes this detached
+                // connection. Server-side timers must not race it into a schema
+                // or history diagnostic, including inherited role lock timeouts.
+                conn.execute("SET LOCAL statement_timeout = 0; SET LOCAL lock_timeout = 0")
                     .await?;
                 let prefix = preflight(&mut conn, &MIGRATOR, &baselines(), None).await?;
                 if prefix != Some(MIGRATOR.iter().count()) {
@@ -61,7 +125,24 @@ impl Database {
             result
         })
         .await;
-        matches!(result, Ok(Ok(())))
+        let cause = match result {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(Cause::Database(error)),
+            Err(_) if acquired => Some(Cause::Timeout),
+            Err(_) => Some(Cause::Database(DatabaseError::Unreachable)),
+        };
+        let mut last = self.last.lock().unwrap();
+        let change = if *last != cause {
+            *last = cause;
+            Some(cause.map_or(Change::Ready, Change::NotReady))
+        } else {
+            None
+        };
+        ProbeResult {
+            outcome: cause.map_or(Probe::Ready, Probe::NotReady),
+            change,
+            ready: cause.is_none(),
+        }
     }
 
     pub async fn close(&self) {
@@ -109,9 +190,10 @@ impl Database {
                 .connect_lazy_with(options.clone()),
             readiness: PgPoolOptions::new()
                 .max_connections(1)
-                .acquire_timeout(READY_TIMEOUT)
+                .acquire_timeout(Duration::from_millis(1500))
                 .connect_lazy_with(options),
             permit: Arc::new(Semaphore::new(1)),
+            last: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -174,7 +256,7 @@ async fn locked<E: From<DatabaseError>>(
     }
     let mut conn = timeout(startup, PgConnection::connect_with(options))
         .await
-        .map_err(|_| DatabaseError::StartupDeadline)?
+        .map_err(|_| DatabaseError::Unreachable)?
         .map_err(DatabaseError::from)?;
     let mut cancellation = timeout(startup, Cancellation::new(&mut conn, options.clone()))
         .await
@@ -303,11 +385,11 @@ async fn preflight(
         sqlx::query_as("SELECT product, format_version FROM public.sidereal_metadata")
             .fetch_all(&mut *conn)
             .await
-            .map_err(|_| DatabaseError::Ownership)?;
+            .map_err(|error| preflight_error(error, DatabaseError::Ownership))?;
     if identity != [("sidereal".to_owned(), 1)] {
         return Err(DatabaseError::Ownership);
     }
-    let records = sqlx::query("SELECT version, description, success, checksum FROM public._sqlx_migrations ORDER BY version").fetch_all(&mut *conn).await.map_err(|_| DatabaseError::History)?;
+    let records = sqlx::query("SELECT version, description, success, checksum FROM public._sqlx_migrations ORDER BY version").fetch_all(&mut *conn).await.map_err(|error| preflight_error(error, DatabaseError::History))?;
     if records.is_empty() || records.len() > migrator.iter().count() {
         return Err(DatabaseError::History);
     }
@@ -324,6 +406,15 @@ async fn preflight(
         return Err(DatabaseError::Schema);
     }
     Ok(Some(records.len()))
+}
+
+fn preflight_error(error: sqlx::Error, fallback: DatabaseError) -> DatabaseError {
+    match DatabaseError::from(error) {
+        error @ (DatabaseError::Unreachable | DatabaseError::Tls | DatabaseError::Permission) => {
+            error
+        }
+        _ => fallback,
+    }
 }
 
 async fn privileges(

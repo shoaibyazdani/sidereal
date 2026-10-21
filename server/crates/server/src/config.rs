@@ -10,6 +10,7 @@ use sqlx::{
 use std::{
     ffi::OsStr,
     fmt,
+    io::Read,
     net::IpAddr,
     path::{Path, PathBuf},
     str::FromStr,
@@ -84,12 +85,39 @@ impl DatabaseConfig {
             _ => return Err(DatabaseError::Configuration),
         };
         let options = parsed.ssl_mode(mode).disable_statement_logging();
+        certificate_files(&options)?;
         Ok(Self {
             options,
             startup_timeout,
             migration_timeout,
         })
     }
+}
+
+fn certificate_files(options: &PgConnectOptions) -> Result<(), DatabaseError> {
+    const LIMIT: u64 = 1024 * 1024;
+    for (name, value) in options.to_url_lossy().query_pairs() {
+        if !matches!(name.as_ref(), "sslrootcert" | "sslcert" | "sslkey") {
+            continue;
+        }
+        let Some(path) = value.strip_prefix("file: ") else {
+            continue;
+        };
+        let check = || -> std::io::Result<bool> {
+            let metadata = std::fs::metadata(path)?;
+            if !metadata.is_file() || metadata.len() > LIMIT {
+                return Ok(false);
+            }
+            let file = std::fs::File::open(path)?;
+            // One extra byte distinguishes a file that grew since metadata().
+            let count = std::io::copy(&mut file.take(LIMIT + 1), &mut std::io::sink())?;
+            Ok(count <= LIMIT)
+        };
+        if !check().unwrap_or(false) {
+            return Err(DatabaseError::CertificateFile);
+        }
+    }
+    Ok(())
 }
 
 /// Why the optional `WEB_ROOT` folder cannot be served.
@@ -168,6 +196,85 @@ fn seconds(value: Option<&str>) -> Result<Duration, DatabaseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn certificate_paths_are_checked_and_redacted() {
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.workspace/certificate-tests");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let valid = root.join("valid.pem");
+        std::fs::write(&valid, "test certificate bytes").unwrap();
+        let large = root.join("large.pem");
+        std::fs::File::create(&large)
+            .unwrap()
+            .set_len(1024 * 1024 + 1)
+            .unwrap();
+        let pipe = root.join("pipe");
+        let _ = std::fs::remove_file(&pipe);
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&pipe)
+            .status()
+            .unwrap()
+            .success());
+        for path in [
+            root.join("missing.pem"),
+            root.clone(),
+            pipe.clone(),
+            large.clone(),
+        ] {
+            for key in ["sslrootcert", "sslcert", "sslkey"] {
+                let mut url = url::Url::parse("postgres://localhost/db").unwrap();
+                url.query_pairs_mut()
+                    .append_pair(key, path.to_str().unwrap());
+                let start = std::time::Instant::now();
+                let error = DatabaseConfig::parse(Some(url.as_str()), None, None)
+                    .err()
+                    .unwrap();
+                assert!(start.elapsed() < Duration::from_secs(1));
+                assert_eq!(error, DatabaseError::CertificateFile);
+                assert!(!error.to_string().contains(path.to_str().unwrap()));
+            }
+        }
+        let options = PgConnectOptions::new().ssl_root_cert(&valid);
+        assert_eq!(certificate_files(&options), Ok(()));
+        let inline = PgConnectOptions::new()
+            .ssl_root_cert_from_pem(b"inline CA".to_vec())
+            .ssl_client_cert_from_pem(b"inline certificate")
+            .ssl_client_key_from_pem(b"inline key");
+        assert_eq!(certificate_files(&inline), Ok(()));
+        std::fs::remove_file(pipe).unwrap();
+        std::fs::remove_file(large).unwrap();
+        std::fs::remove_file(valid).unwrap();
+    }
+
+    #[test]
+    fn certificate_environment_is_checked() {
+        const CHILD: &str = "SIDEREAL_CERTIFICATE_ENV_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            let error = DatabaseConfig::parse(Some("postgres://localhost/db"), None, None)
+                .err()
+                .unwrap();
+            assert_eq!(error, DatabaseError::CertificateFile);
+            assert!(!error.to_string().contains("distinctive-missing-ca.pem"));
+            return;
+        }
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "config::tests::certificate_environment_is_checked",
+            ])
+            .env(CHILD, "1")
+            .env("PGSSLROOTCERT", "distinctive-missing-ca.pem")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+    }
+
     #[test]
     fn transport_policy() {
         for (value, expected) in [

@@ -298,7 +298,7 @@ async fn readiness_is_bounded_consistent_and_read_only() {
     assert!(database.ready().await);
     let permit = database.permit.acquire().await.unwrap();
     let start = Instant::now();
-    assert!(!database.ready().await);
+    assert!(database.ready().await);
     assert!(start.elapsed() < Duration::from_millis(100));
     drop(permit);
     let mut conn = connection(&db).await;
@@ -578,11 +578,30 @@ async fn unresponsive_connection_deadline_closes_socket() {
             None
         )
         .await,
-        Err(DatabaseError::StartupDeadline)
+        Err(DatabaseError::Unreachable)
     );
     assert!(start.elapsed() < Duration::from_millis(350));
     timeout(Duration::from_millis(250), peer)
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn silent_relay_reports_unreachable_within_startup_deadline() {
+    use crate::test_support::{Relay, RelayMode};
+    let relay = Relay::new("127.0.0.1:9".parse().unwrap()).await;
+    relay.set_mode(RelayMode::Silent);
+    let options = PgConnectOptions::new()
+        .host("127.0.0.1")
+        .port(relay.port)
+        .ssl_mode(sqlx::postgres::PgSslMode::Disable);
+    let start = Instant::now();
+    let error = initialize(options, Duration::from_secs(1), Duration::from_secs(1))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error, DatabaseError::Unreachable);
+    assert!(error.to_string().starts_with("database unreachable"));
+    assert!(start.elapsed() < Duration::from_millis(1250));
 }
