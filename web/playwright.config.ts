@@ -1,17 +1,20 @@
 import { defineConfig, devices } from "@playwright/test";
 
 // End-to-end tests run against the real stack: the Rust server on 5000 and
-// Vite on 5173. Vite proxies /api, /healthz and /readyz to the server, so
-// the browser only ever talks to Vite while the server sits behind the
-// proxy exactly as it does in production.
+// Vite on 5173. Vite proxies /healthz to the server, so the browser only ever
+// talks to Vite while the server sits behind the proxy exactly as it does in
+// production.
 const SERVER_URL = "http://localhost:5000";
 const WEB_URL = "http://localhost:5173";
 
 // A developer almost always has `just dev` running already. Reusing the
 // existing process keeps the suite fast; when nothing is listening the
-// command below starts it and Playwright waits for the port.
-const reuseExisting =
-  process.env.PLAYWRIGHT_REUSE_SERVER === "1" || process.env.CI !== "true";
+// command below starts it and Playwright waits for the port. An explicit
+// PLAYWRIGHT_REUSE_SERVER=0 forces a fresh stack and =1 forces reuse; unset
+// means "reuse locally, never on CI".
+const reuseExisting = process.env.PLAYWRIGHT_REUSE_SERVER
+  ? process.env.PLAYWRIGHT_REUSE_SERVER === "1"
+  : !process.env.CI;
 
 export default defineConfig({
   testDir: "./e2e",
@@ -49,7 +52,7 @@ export default defineConfig({
     {
       command: "pnpm dev --port 5173 --strictPort",
       url: WEB_URL,
-      reuseExistingServer: true,
+      reuseExistingServer: reuseExisting,
       timeout: 120_000,
       stdout: "pipe",
       stderr: "pipe",
