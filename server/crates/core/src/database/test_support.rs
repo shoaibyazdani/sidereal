@@ -127,3 +127,194 @@ fn concurrent_databases_have_distinct_names() {
     let second = TestDatabase::new();
     assert_ne!(first.options.get_database(), second.options.get_database());
 }
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum RelayMode {
+    Forward,
+    Refuse,
+    Silent,
+}
+
+/// A loopback fault injector. Changing mode also closes existing connections.
+pub(super) struct Relay {
+    pub port: u16,
+    mode: tokio::sync::watch::Sender<RelayMode>,
+    task: tokio::task::JoinHandle<()>,
+    history: std::sync::Arc<HistoryGate>,
+}
+
+#[derive(Default)]
+struct HistoryGate {
+    paused: std::sync::atomic::AtomicBool,
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+async fn forward(
+    client: &mut tokio::net::TcpStream,
+    server: &mut tokio::net::TcpStream,
+    gate: &HistoryGate,
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    const QUERY: &[u8] =
+        b"SELECT version, description, success, checksum FROM public._sqlx_migrations";
+    let (mut incoming, mut outgoing) = client.split();
+    let (mut reply, mut destination) = server.split();
+    let send = async {
+        let mut buffer = [0; 8192];
+        let mut tail = Vec::new();
+        loop {
+            let count = incoming.read(&mut buffer).await?;
+            if count == 0 {
+                return destination.shutdown().await;
+            }
+            tail.extend_from_slice(&buffer[..count]);
+            if gate.paused.load(Ordering::SeqCst)
+                && tail.windows(QUERY.len()).any(|part| part == QUERY)
+            {
+                gate.reached.notify_one();
+                gate.release.notified().await;
+            }
+            destination.write_all(&buffer[..count]).await?;
+            if tail.len() > QUERY.len() {
+                tail.drain(..tail.len() - QUERY.len());
+            }
+        }
+    };
+    let receive = tokio::io::copy(&mut reply, &mut outgoing);
+    tokio::try_join!(send, receive)?;
+    Ok(())
+}
+
+impl Relay {
+    pub async fn new(target: std::net::SocketAddr) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (mode, mut changes) = tokio::sync::watch::channel(RelayMode::Forward);
+        let history = std::sync::Arc::new(HistoryGate::default());
+        let gate = history.clone();
+        let task = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let Ok((mut client, _)) = accepted else { break };
+                        let mut changed = changes.clone();
+                        let current = *changed.borrow_and_update();
+                        let gate = gate.clone();
+                        connections.spawn(async move {
+                            tokio::select! {
+                                _ = changed.changed() => {},
+                                _ = async {
+                                    match current {
+                                        RelayMode::Refuse => {},
+                                        RelayMode::Silent => std::future::pending::<()>().await,
+                                        RelayMode::Forward => {
+                                            if let Ok(mut server) = tokio::net::TcpStream::connect(target).await {
+                                                let _ = forward(&mut client, &mut server, &gate).await;
+                                            }
+                                        }
+                                    }
+                                } => {},
+                            }
+                        });
+                    },
+                    _ = changes.changed() => {},
+                    Some(_) = connections.join_next() => {},
+                }
+            }
+        });
+        Self {
+            port,
+            mode,
+            task,
+            history,
+        }
+    }
+
+    pub fn hold_history(&self) {
+        self.history.paused.store(true, Ordering::SeqCst);
+    }
+
+    pub async fn history_reached(&self) {
+        tokio::time::timeout(Duration::from_secs(1), self.history.reached.notified())
+            .await
+            .unwrap();
+    }
+
+    pub fn release_history(&self) {
+        self.history.paused.store(false, Ordering::SeqCst);
+        self.history.release.notify_one();
+    }
+
+    pub fn set_mode(&self, mode: RelayMode) {
+        self.mode.send_replace(mode);
+    }
+
+    pub fn close_connections(&self) {
+        self.mode.send_modify(|_| {});
+    }
+}
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[tokio::test]
+async fn relay_forwards_refuses_stalls_and_closes_connections() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay = Relay::new(listener.local_addr().unwrap()).await;
+    let echo = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let (mut read, mut write) = socket.split();
+                let _ = tokio::io::copy(&mut read, &mut write).await;
+            });
+        }
+    });
+    let mut client = tokio::net::TcpStream::connect(("127.0.0.1", relay.port))
+        .await
+        .unwrap();
+    client.write_all(b"hello").await.unwrap();
+    let mut bytes = [0; 5];
+    client.read_exact(&mut bytes).await.unwrap();
+    assert_eq!(&bytes, b"hello");
+    relay.close_connections();
+    assert_eq!(client.read(&mut bytes).await.unwrap(), 0);
+    relay.set_mode(RelayMode::Refuse);
+    let mut client = tokio::net::TcpStream::connect(("127.0.0.1", relay.port))
+        .await
+        .unwrap();
+    assert_eq!(client.read(&mut bytes).await.unwrap(), 0);
+    relay.set_mode(RelayMode::Silent);
+    let mut client = tokio::net::TcpStream::connect(("127.0.0.1", relay.port))
+        .await
+        .unwrap();
+    client.write_all(b"hello").await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), client.read(&mut bytes))
+            .await
+            .is_err()
+    );
+    relay.set_mode(RelayMode::Forward);
+    assert!(client.read(&mut bytes).await.unwrap_or(0) == 0);
+    let mut client = tokio::net::TcpStream::connect(("127.0.0.1", relay.port))
+        .await
+        .unwrap();
+    client.write_all(b"again").await.unwrap();
+    client.read_exact(&mut bytes).await.unwrap();
+    assert_eq!(&bytes, b"again");
+    relay.hold_history();
+    let query = b"SELECT version, description, success, checksum FROM public._sqlx_migrations";
+    client.write_all(query).await.unwrap();
+    relay.history_reached().await;
+    relay.release_history();
+    let mut echoed = vec![0; query.len()];
+    client.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(echoed, query);
+    echo.abort();
+}
